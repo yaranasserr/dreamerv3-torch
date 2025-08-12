@@ -36,18 +36,16 @@ def convert_hdf5_to_dreamer(hdf5_path, camera_key='agentview_rgb'):
         for i, (images, actions, dones) in enumerate(zip(all_images, all_actions, all_dones)):
             T = len(actions)
             
-            # Pad if necessary
             if T < max_length:
                 pad_length = max_length - T
                 images = np.concatenate([images, np.zeros((pad_length,) + images.shape[1:], dtype=images.dtype)])
                 actions = np.concatenate([actions, np.zeros((pad_length,) + actions.shape[1:], dtype=actions.dtype)])
-                dones = np.concatenate([dones, np.ones(pad_length, dtype=dones.dtype)])  # Mark padding as done
+                dones = np.concatenate([dones, np.ones(pad_length, dtype=dones.dtype)])  
             
-            # Create is_first mask
             is_first = np.zeros(max_length, dtype=bool)
             is_first[0] = True
             
-            # Create discount (still useful for episode boundaries)
+     
             discount = 1.0 - dones.astype(np.float32)
             
             batch_images.append(images)
@@ -56,7 +54,7 @@ def convert_hdf5_to_dreamer(hdf5_path, camera_key='agentview_rgb'):
             batch_is_first.append(is_first)
             batch_discount.append(discount)
         
-        # Convert to tensors - NO REWARD TENSOR
+        # Convert to tensors 
         obs = {
             'image': torch.from_numpy(np.stack(batch_images)).float(),      # (B, T, H, W, C)
             'action': torch.from_numpy(np.stack(batch_actions)).float(),    # (B, T, A)
