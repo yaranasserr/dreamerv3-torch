@@ -17,7 +17,9 @@ defaults:
   kl_free: 1.0
   dyn_scale: 0.5
   rep_scale: 0.1
-  grad_heads: [decoder, reward]
+  
+
+  grad_heads: [decoder]
 
   model_lr: 0.0006
   opt_eps: 0.00001
@@ -25,11 +27,19 @@ defaults:
   weight_decay: 0.0
   opt: adam
 
+ 
   reward_head:
-    dist: none
+    dist: symlog_disc        
+    layers: 2
+    outscale: 0.0     
+    loss_scale: 0.0    
+
+
+  cont_head:
+    dist: symlog_disc
     layers: 2
     outscale: 0.0
-    loss_scale: 0.0
+    loss_scale: 0.0 
 
   encoder:
     cnn_keys: image
