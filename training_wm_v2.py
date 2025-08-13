@@ -502,6 +502,7 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
                     break
 
             if val_metrics_list:
+                
                 # Average all validation metrics
                 avg_val_metrics = {}
                 for key in val_metrics_list[0].keys():
