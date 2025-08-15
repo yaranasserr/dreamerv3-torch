@@ -183,8 +183,6 @@ def setup_config_for_worldmodel(cfg_dict, size_overrides):
 
 
 
-
-
 def compute_validation_loss(wm, batch):
     """Compute proper validation loss including reconstruction loss"""
     try:
@@ -254,14 +252,12 @@ def compute_validation_loss(wm, batch):
         print(f"Validation error: {e}")
         return None
 
-
-
 def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=16, 
                     batch_length=64, checkpoint_dir='./checkpoints', log_dir='./logs',
                     resume_from=None, save_every=10, eval_every=5, 
                     gradient_accumulation_steps=1, max_sequences_per_file=None,
                     shuffle_files=True, sequence_mode='pad', max_sequence_length=None):
-    """Train the WorldModel on multiple HDF5 files with FIXED preprocessing."""
+    """Train the WorldModel on multiple HDF5 files with improved error handling."""
     print(f"Starting WorldModel training with size: {size}")
     print(f"Training for {epochs} epochs")
     print(f"Batch size: {batch_size}, Batch length: {batch_length}")
@@ -322,26 +318,23 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
         raise ValueError(f"Invalid sequence_mode: {sequence_mode}")
 
     # Data validation and preprocessing
-    print("\n=== FIXED DATA PREPROCESSING ===")
-    print(f"Original - Image dtype: {data['image'].dtype}, range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
-    print(f"Original - Action dtype: {data['action'].dtype}, range: [{data['action'].min():.3f}, {data['action'].max():.3f}]")
+    print("\nValidating and preprocessing data...")
+    print(f"Image dtype: {data['image'].dtype}, range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
+    print(f"Action dtype: {data['action'].dtype}, range: [{data['action'].min():.3f}, {data['action'].max():.3f}]")
 
+    if data['image'].max() <= 1.0:
+        # If data is already normalized to [0,1], scale back to [0,255]
+        print("Data appears to be normalized to [0,1], scaling back to [0,255] for WorldModel")
+        data['image'] = data['image'] * 255.0
+        print(f"After scaling - Image range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
     
-    # Check if images are in [0, 255] or [0, 1] range
-    if data['image'].max() > 1.0:
-        print("Images are in [0, 255] range - WorldModel.preprocess() should handle normalization")
-        print("NOT normalizing here to avoid double normalization!")
-        # Keep images in [0, 255] range - let WorldModel handle it properly
-    else:
-        print("Images already in [0, 1] range")
+    print(f"Final image range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
 
-    # Ensure correct data types
-    data['image'] = data['image'].float()  # Keep in original range!
+    # Ensure correct data types (but keep images as float32 for precision)
+    data['image'] = data['image'].float()  # Keep as float32 but in [0,255] range
     data['action'] = data['action'].float()
     data['is_terminal'] = data['is_terminal'].bool()
     data['is_first'] = data['is_first'].bool()
-
-    print(f"Final - Image range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
 
     # Setup model configuration
     actual_action_dim = data['action'].shape[-1]
@@ -350,38 +343,16 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
     device = cfg_dict.get('device', 'cuda')
 
     # Create observation and action spaces
+    # IMPORTANT: Update the observation space to reflect [0,255] range
     image_shape = data['image'].shape[2:]  # (H, W, C)
-
-    if data['image'].max() > 1.0:
-        # Data is in [0, 255] range
-        obs_space = Dict({'image': Box(low=0, high=255, shape=image_shape, dtype=np.float32)})
-        print("Set observation space to [0, 255] range")
-    else:
-        # Data is in [0, 1] range  
-        obs_space = Dict({'image': Box(low=0, high=1, shape=image_shape, dtype=np.float32)})
-        print("Set observation space to [0, 1] range")
-        
+    obs_space = Dict({'image': Box(low=0, high=255, shape=image_shape, dtype=np.float32)})
     act_space = Box(low=-1.0, high=1.0, shape=(actual_action_dim,), dtype=np.float32)
 
-
+    print("Initializing WorldModel...")
     try:
         wm = WorldModel(obs_space, act_space, 0, cfg).to(device)
         print("WorldModel initialized successfully!")
         print(f"Model parameters: {sum(p.numel() for p in wm.parameters()):,}")
-        
-        test_batch = {k: v[:1, :5].to(device) for k, v in data.items() if k in ['image', 'action', 'is_terminal', 'is_first']}
-        test_batch['reward'] = torch.zeros(1, 5, device=device)
-        
-        with torch.no_grad():
-            preprocessed = wm.preprocess(test_batch)
-            print(f"Before preprocess: [{test_batch['image'].min():.6f}, {test_batch['image'].max():.6f}]")
-            print(f"After preprocess:  [{preprocessed['image'].min():.6f}, {preprocessed['image'].max():.6f}]")
-            
-            if preprocessed['image'].max() < 0.01:
-                raise ValueError("Preprocessing error - images too dark")
-            else:
-                print("✅ Preprocessing looks good!")
-        
     except Exception as e:
         print(f"Error initializing WorldModel: {e}")
         import traceback
@@ -433,18 +404,14 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
             batch['reward'] = torch.zeros(batch['action'].shape[0], batch['action'].shape[1], 
                               device=device, dtype=torch.float32)
             
-            # Debug info for first few batches to monitor preprocessing
+            # Debug info for first few batches
             if num_batches < 3:
                 print(f"\nBatch {num_batches} debug info:")
                 for k, v in batch.items():
                     print(f"  {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}")
                     if k == 'image':
-                        print(f"    image range before model: [{v.min().item():.3f}, {v.max().item():.3f}]")
-                        
-                        # Test preprocessing on this batch
-                        with torch.no_grad():
-                            preprocessed = wm.preprocess({k: v for k, v in batch.items()})
-                            print(f"    image range after preprocess: [{preprocessed['image'].min().item():.6f}, {preprocessed['image'].max().item():.6f}]")
+                        print(f"    image range: [{v.min().item():.3f}, {v.max().item():.3f}]")
+                        print(f"    Expected: images should be in [0, 255] range before WorldModel.preprocess")
             
             try:
                 # Use the original _train method
@@ -501,8 +468,7 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
         if epoch_metrics:
             avg_metrics = {k: np.mean(v) for k, v in epoch_metrics.items()}
             total_loss = avg_metrics.get('model_loss', float('inf'))
-            image_loss = avg_metrics.get('image_loss', 0)
-            print(f"Train loss: {total_loss:.4f}, Image loss: {image_loss:.4f} (from {successful_batches}/{num_batches} successful batches)")
+            print(f"Train loss: {total_loss:.4f} (from {successful_batches}/{num_batches} successful batches)")
 
             # Log training metrics
             for k, v in avg_metrics.items():
