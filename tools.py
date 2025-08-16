@@ -507,7 +507,7 @@ class DiscDist:
 
 
 class MSEDist:
-    def __init__(self, mode, agg="sum"):
+    def __init__(self, mode, agg="mean"):
         self._mode = mode
         self._agg = agg
 
@@ -526,7 +526,7 @@ class MSEDist:
             loss = distance.sum(list(range(len(distance.shape)))[2:])
         else:
             raise NotImplementedError(self._agg)
-        return -loss
+        return  -loss
 
 
 class SymlogDist:

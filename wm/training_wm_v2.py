@@ -12,7 +12,8 @@ from pathlib import Path
 import gymnasium as gym
 from gymnasium.spaces import Box, Dict
 from models import WorldModel
-from hdf5_converter import convert_hdf5_to_dreamer
+
+from .hdf5_converter import convert_hdf5_to_dreamer
 from types import SimpleNamespace
 import time
 import json
@@ -77,7 +78,7 @@ def apply_size_override(config, size_key):
 
 
 def setup_config_for_worldmodel(cfg_dict, size_overrides):
-    """Setup configuration for WorldModel with proper heads for image-only training"""
+
     rssm_key = '.*\\.rssm'
     depth_key = '.*\\.depth'
     units_key = '.*\\.units'
@@ -153,6 +154,7 @@ def setup_config_for_worldmodel(cfg_dict, size_overrides):
             'image_dist': 'mse', 
             'vector_dist': 'symlog_mse',
             'outscale': 1.0
+           
         },
         
         # Disable reward and continuation heads by setting loss_scale to 0
@@ -251,39 +253,89 @@ def compute_validation_loss(wm, batch):
     except Exception as e:
         print(f"Validation error: {e}")
         return None
+def compute_validation_loss_MSE_AWARE(wm, batch):
+    """Validation loss that properly handles MSE distribution"""
+    try:
+        with torch.no_grad():
+            data = wm.preprocess(batch)
+            embed = wm.encoder(data)
+            post, prior = wm.dynamics.observe(embed, data["action"], data["is_first"])
+            
+            # KL loss (same as before)
+            kl_free = wm._config.kl_free
+            dyn_scale = wm._config.dyn_scale
+            rep_scale = wm._config.rep_scale
+            kl_loss, kl_value, dyn_loss, rep_loss = wm.dynamics.kl_loss(
+                post, prior, kl_free, dyn_scale, rep_scale
+            )
+            
+            # Head predictions (same as training)
+            preds = {}
+            for name, head in wm.heads.items():
+                grad_head = name in wm._config.grad_heads
+                feat = wm.dynamics.get_feat(post)
+                feat = feat if grad_head else feat.detach()
+                pred = head(feat)
+                if type(pred) is dict:
+                    preds.update(pred)
+                else:
+                    preds[name] = pred
+            
+            # Compute losses (same as training)
+            losses = {}
+            for name, pred in preds.items():
+                if name in data:
+                    loss = -pred.log_prob(data[name])
+                    losses[name] = loss
+            
+            # Apply scales (same as training) 
+            scaled = {
+                key: value * wm._scales.get(key, 1.0)
+                for key, value in losses.items()
+            }
+            
+            model_loss = sum(scaled.values()) + kl_loss
+            total_loss = torch.mean(model_loss)
+            
+            metrics = {
+                'total_loss': total_loss.item(),
+                'kl_loss': torch.mean(kl_loss).item(),
+                'dyn_loss': torch.mean(dyn_loss).item(),
+                'rep_loss': torch.mean(rep_loss).item(),
+            }
+            
+            for name, loss in losses.items():
+                metrics[f'{name}_loss'] = torch.mean(loss).item()
+                
+            # Debug print for first few calls
+            if not hasattr(compute_validation_loss_MSE_AWARE, 'call_count'):
+                compute_validation_loss_MSE_AWARE.call_count = 0
+            compute_validation_loss_MSE_AWARE.call_count += 1
+            
+            if compute_validation_loss_MSE_AWARE.call_count <= 3:
+                print(f"Validation debug call {compute_validation_loss_MSE_AWARE.call_count}:")
+                print(f"  Total loss: {total_loss.item():.3f}")
+                for name, loss in losses.items():
+                    if wm._scales.get(name, 1.0) > 0:
+                        print(f"  {name} loss: {torch.mean(loss).item():.3f} (scale: {wm._scales.get(name, 1.0)})")
+            
+            return metrics
+            
+    except Exception as e:
+        print(f"Validation error: {e}")
+        return None
+    
+
 
 def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=16, 
                     batch_length=64, checkpoint_dir='./checkpoints', log_dir='./logs',
                     resume_from=None, save_every=10, eval_every=5, 
                     gradient_accumulation_steps=1, max_sequences_per_file=None,
                     shuffle_files=True, sequence_mode='pad', max_sequence_length=None):
-    """Train the WorldModel on multiple HDF5 files with improved error handling."""
-    print(f"Starting WorldModel training with size: {size}")
-    print(f"Training for {epochs} epochs")
-    print(f"Batch size: {batch_size}, Batch length: {batch_length}")
-    print(f"Sequence handling mode: {sequence_mode}")
-    
-    # Setup CUDA optimizations
-    torch.backends.cudnn.benchmark = True
-    if torch.cuda.is_available():
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB")
-        torch.cuda.empty_cache()
-
-    # Adjust batch size for limited GPU memory
-    if torch.cuda.is_available():
-        gpu_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-        if gpu_memory_gb < 6:
-            batch_size = min(batch_size, 8)
-            batch_length = min(batch_length, 32)
-            print(f"Reduced batch size to {batch_size} and length to {batch_length} for limited GPU memory")
-
-    # Create directories
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
-
     # Setup logging
     writer = SummaryWriter(log_dir)
-
     # Load and setup config
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
@@ -295,15 +347,12 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
     size_overrides = config.get(size_key, {})
     cfg_dict = setup_config_for_worldmodel(cfg_dict, size_overrides)
 
-    # Get HDF5 files
     hdf5_files = get_hdf5_files_from_pattern(hdf5_input)
-    if not hdf5_files:
-        raise ValueError(f"No HDF5 files found with pattern: {hdf5_input}")
+    
     if shuffle_files:
         import random
         random.shuffle(hdf5_files)
 
-    print("Loading data...")
     if sequence_mode == 'pad':
         data = load_multiple_hdf5_files(
             hdf5_files, max_sequences_per_file=max_sequences_per_file,
@@ -317,33 +366,21 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
     else:
         raise ValueError(f"Invalid sequence_mode: {sequence_mode}")
 
-    # Data validation and preprocessing
-    print("\nValidating and preprocessing data...")
-    print(f"Image dtype: {data['image'].dtype}, range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
-    print(f"Action dtype: {data['action'].dtype}, range: [{data['action'].min():.3f}, {data['action'].max():.3f}]")
-
+    
     if data['image'].max() <= 1.0:
         # If data is already normalized to [0,1], scale back to [0,255]
-        print("Data appears to be normalized to [0,1], scaling back to [0,255] for WorldModel")
         data['image'] = data['image'] * 255.0
-        print(f"After scaling - Image range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
     
-    print(f"Final image range: [{data['image'].min():.3f}, {data['image'].max():.3f}]")
-
-    # Ensure correct data types (but keep images as float32 for precision)
-    data['image'] = data['image'].float()  # Keep as float32 but in [0,255] range
+    data['image'] = data['image'].float()  
     data['action'] = data['action'].float()
     data['is_terminal'] = data['is_terminal'].bool()
     data['is_first'] = data['is_first'].bool()
 
-    # Setup model configuration
     actual_action_dim = data['action'].shape[-1]
     cfg_dict['num_actions'] = actual_action_dim
     cfg = Config(**cfg_dict)
     device = cfg_dict.get('device', 'cuda')
 
-    # Create observation and action spaces
-    # IMPORTANT: Update the observation space to reflect [0,255] range
     image_shape = data['image'].shape[2:]  # (H, W, C)
     obs_space = Dict({'image': Box(low=0, high=255, shape=image_shape, dtype=np.float32)})
     act_space = Box(low=-1.0, high=1.0, shape=(actual_action_dim,), dtype=np.float32)
@@ -403,21 +440,13 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
             # Add dummy reward tensor (required by WorldModel but won't be trained)
             batch['reward'] = torch.zeros(batch['action'].shape[0], batch['action'].shape[1], 
                               device=device, dtype=torch.float32)
-            
-            # Debug info for first few batches
-            if num_batches < 3:
-                print(f"\nBatch {num_batches} debug info:")
-                for k, v in batch.items():
-                    print(f"  {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}")
-                    if k == 'image':
-                        print(f"    image range: [{v.min().item():.3f}, {v.max().item():.3f}]")
-                        print(f"    Expected: images should be in [0, 255] range before WorldModel.preprocess")
+
             
             try:
                 # Use the original _train method
                 post, context, metrics = wm._train(batch)
                 
-                # Filter out reward-related metrics since we disabled them
+                # Filter out reward-related metrics 
                 metrics = {k: v for k, v in metrics.items() 
                           if not any(x in k.lower() for x in ['reward', 'rew'])}
                 
@@ -448,18 +477,9 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
                 print(f"OOM at batch {num_batches}. Clearing cache and skipping.")
                 torch.cuda.empty_cache()
                 continue
-            except Exception as e:
-                print(f"Detailed error in batch {num_batches}:")
-                print(f"  Error type: {type(e).__name__}")
-                print(f"  Error message: {str(e)}")
-                if num_batches < 5:  # Print full traceback for first few errors
-                    import traceback
-                    traceback.print_exc()
-                torch.cuda.empty_cache()
-                continue
             
             num_batches += 1
-            
+                
             # Periodic cleanup
             if num_batches % 5 == 0:
                 torch.cuda.empty_cache()
@@ -478,7 +498,6 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
             total_loss = float('inf')
             avg_metrics = {}
 
-        # Proper validation with reconstruction loss
         avg_val_loss = None
         if epoch % eval_every == 0 and len(val_data['image']) > 0:
             print("Running validation...")
@@ -487,31 +506,28 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
             val_batches = 0
             successful_val_batches = 0
             
-            for batch in create_data_loader(val_data, max(1, batch_size//2), max(16, batch_length//2), shuffle=False):
+            for i, batch in enumerate(create_data_loader(val_data, max(1, batch_size//2), max(16, batch_length//2), shuffle=False)):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 batch['reward'] = torch.zeros(batch['action'].shape[0], batch['action'].shape[1], 
                                             device=device, dtype=torch.float32)
-                
-                # Use proper validation loss computation
-                val_metrics = compute_validation_loss(wm, batch)
+            
+                val_metrics = compute_validation_loss_MSE_AWARE(wm, batch)
                 if val_metrics is not None:
                     val_metrics_list.append(val_metrics)
                     successful_val_batches += 1
                         
                 val_batches += 1
-                if val_batches >= 10:  # Limit validation batches
+                if val_batches >= 10:  
                     break
 
             if val_metrics_list:
                 
-                # Average all validation metrics
                 avg_val_metrics = {}
                 for key in val_metrics_list[0].keys():
                     avg_val_metrics[key] = np.mean([m[key] for m in val_metrics_list])
                 
                 avg_val_loss = avg_val_metrics['total_loss']
                 
-                # Log all validation metrics
                 for k, v in avg_val_metrics.items():
                     writer.add_scalar(f'val/{k}', v, epoch)
                 
@@ -522,9 +538,7 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
                 is_best = avg_val_loss < best_loss
                 if is_best:
                     best_loss = avg_val_loss
-            else:
-                is_best = False
-                print("No successful validation batches.")
+          
         else:
             is_best = False
 
@@ -545,6 +559,10 @@ def train_worldmodel(config_path, hdf5_input, size='1m', epochs=100, batch_size=
     writer.close()
     print(f"\nTraining complete! Best validation loss: {best_loss:.4f}")
     return wm
+
+
+
+
 
 def save_checkpoint(model, epoch, metrics, base_checkpoint_dir, is_best=False):
     """Save model checkpoints into a timestamped subfolder."""
